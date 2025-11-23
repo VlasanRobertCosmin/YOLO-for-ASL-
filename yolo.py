@@ -1,74 +1,62 @@
-import cv2, mediapipe as mp
+import argparse
+import subprocess
 from pathlib import Path
+import sys
 
-# INPUT (your raw images by class folders)
-IMG_DIR = Path("data/asl_images")      
+def main():
+    p = argparse.ArgumentParser(description="Ultralytics YOLO training launcher (Windows friendly)")
+    p.add_argument("--data", default=None, help="Path to dataset yaml (default: ./asl.yaml)")
+    p.add_argument("--model", default="yolov8n.pt", help="Base model: yolov8n.pt, yolov8s.pt, etc.")
+    p.add_argument("--imgsz", type=int, default=416, help="Image size (square). 416 is a fast starting point.")
+    p.add_argument("--epochs", type=int, default=20, help="Epochs")
+    p.add_argument("--batch", type=int, default=16, help="Batch size")
+    p.add_argument("--name", default="asl_yolo_win", help="Run name under runs/detect/")
+    p.add_argument("--fraction", type=float, default=None, help="Fraction of data to use (e.g., 0.1 for 10%)")
+    p.add_argument("--cache", default="disk", choices=["disk", "ram", "none"], help="Dataloader cache mode")
+    p.add_argument("--workers", type=int, default=2, help="Num dataloader workers (2 is safe on Windows)")
+    p.add_argument("--resume", action="store_true", help="Resume from last checkpoint if found")
+    p.add_argument("--device", default=None, help="Force device: 'cuda' or 'cpu' (auto if not set)")
 
-# OUTPUT (flat YOLO dirs are fine)
-OUT_IMG = Path("data/yolo/images")
-OUT_LBL = Path("data/yolo/labels")
-OUT_IMG.mkdir(parents=True, exist_ok=True)
-OUT_LBL.mkdir(parents=True, exist_ok=True)
+    args = p.parse_args()
+    here = Path(__file__).resolve().parent
 
-# Classes: A–Z + special tokens
-CLASSES = [*list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"), "del", "nothing", "space"]
-CLASS_TO_ID = {c: i for i, c in enumerate(CLASSES)}
+    # Locate data yaml
+    data_yaml = Path(args.data) if args.data else (here / "asl.yaml")
+    if not data_yaml.exists():
+        sys.exit(f"[ERROR] Dataset yaml not found: {data_yaml}")
 
-# MediaPipe Hands (static images)
-mp_hands = mp.solutions.hands.Hands(static_image_mode=True, max_num_hands=1)
+    # Decide device (Windows: CUDA or CPU)
+    device = args.device
+    if device is None:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
 
-def keypoints_bbox(norm_xy):
-    xs = [x for x, _ in norm_xy]; ys = [y for _, y in norm_xy]
-    xmin, xmax = max(0.0, min(xs)), min(1.0, max(xs))
-    ymin, ymax = max(0.0, min(ys)), min(1.0, max(ys))
-    w = max(1e-6, xmax - xmin); h = max(1e-6, ymax - ymin)
-    xc, yc = xmin + w / 2, ymin + h / 2
-    return xc, yc, w, h
+    # Build ultralytics command
+    cmd = [
+        "yolo", "detect", "train",
+        f"data={data_yaml.as_posix()}",
+        f"model={args.model}",
+        f"imgsz={args.imgsz}",
+        f"epochs={args.epochs}",
+        f"batch={args.batch}",
+        f"workers={args.workers}",
+        f"cache={args.cache}",
+        f"name={args.name}",
+        f"device={device}",
+        "verbose=False",
+    ]
+    if args.fraction is not None:
+        cmd.append(f"fraction={args.fraction}")
+    if args.resume:
+        cmd.append("resume=True")
 
-def class_from_path(p: Path):
-    cls = p.parent.name.lower()
-    # normalize any odd names here if needed (e.g., "spacebar" -> "space")
-    if cls == "spacebar": cls = "space"
-    # map back to canonical casing
-    for c in CLASSES:
-        if c.lower() == cls:
-            return c
-    return None
-
-def process_image(p: Path):
-    img = cv2.imread(str(p))
-    if img is None:
-        print(f"[WARN] cannot read: {p}")
-        return
-
-    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    res = mp_hands.process(rgb)
-    if not res.multi_hand_landmarks:
-        # skip images without a detected hand
-        # (or you can write a zero-area box if you prefer)
-        return
-
-    lm = res.multi_hand_landmarks[0].landmark
-    norm_xy = [(l.x, l.y) for l in lm]  # already in [0,1] relative to original image size
-    xc, yc, ww, hh = keypoints_bbox(norm_xy)
-
-    cls = class_from_path(p)
-    if cls is None:
-        print(f"[SKIP] unknown class folder: {p.parent.name}")
-        return
-    cid = CLASS_TO_ID[cls]
-
-    # avoid filename collisions by prefixing class
-    out_img = OUT_IMG / f"{cls}_{p.name}"
-    out_lbl = OUT_LBL / f"{cls}_{p.stem}.txt"
-
-    cv2.imwrite(str(out_img), img)
-    with open(out_lbl, "w") as f:
-        f.write(f"{cid} {xc:.6f} {yc:.6f} {ww:.6f} {hh:.6f}\n")
+    print(">>> Launching:")
+    print(" ".join(cmd))
+    subprocess.run(cmd, check=False)
 
 if __name__ == "__main__":
-    imgs = list(IMG_DIR.rglob("*.jpg")) + list(IMG_DIR.rglob("*.jpeg")) + list(IMG_DIR.rglob("*.png"))
-    for p in imgs:
-        process_image(p)
-    mp_hands.close()
-    print("Done.")
+    # Windows needs the spawn-safe guard for dataloading workers
+    main()
